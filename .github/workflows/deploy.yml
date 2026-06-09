@@ -31,7 +31,7 @@ jobs:
         run: npm run build
         env:
           VITE_DEMO_MODE: "true"
-          VITE_BASE_PATH: ${{ vars.VITE_BASE_PATH || '/' }}
+          VITE_BASE_PATH: ${{ vars.VITE_BASE_PATH || format('/{0}/', github.event.repository.name) }}
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

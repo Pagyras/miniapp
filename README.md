@@ -33,4 +33,4 @@ VITE_DEMO_MODE=false
 
 1. Залейте проект в отдельный GitHub-репозиторий.
 2. В настройках репозитория включите Pages через GitHub Actions.
-3. Если репозиторий не корневой домен, задайте `VITE_BASE_PATH=/<repo-name>/` в GitHub Actions variables или в workflow.
+3. По умолчанию workflow сам выставит base-path как `/<repo-name>/`. Для кастомного домена задайте `VITE_BASE_PATH=/` в GitHub Actions variables.
