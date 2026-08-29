@@ -1,6 +1,5 @@
 import {
   FREE_DELIVERY_THRESHOLD as DEFAULT_FREE_DELIVERY_THRESHOLD,
-  PAID_DELIVERY_PRICE as DEFAULT_PAID_DELIVERY_PRICE,
   PICKUP_ADDRESS as DEFAULT_PICKUP_ADDRESS,
   categoriesSeed,
   productsSeed,
@@ -12,15 +11,17 @@ import {
 } from "../shared";
 import {
   ArrowLeft,
+  Baby,
   BadgeRussianRuble,
   ChevronRight,
   Clock3,
   Home,
   Minus,
+  PackageCheck,
   Plus,
-  Search,
   ShoppingBasket,
   Store,
+  Truck,
   UserRound
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -31,6 +32,7 @@ type CheckoutForm = {
   customerName: string;
   phone: string;
   address: string;
+  comment: string;
   deliveryMethod: DeliveryMethod;
 };
 
@@ -38,7 +40,6 @@ const apiUrl = import.meta.env.VITE_API_URL ?? "";
 const demoMode = import.meta.env.VITE_DEMO_MODE !== "false";
 const fallbackTelegramUserId = import.meta.env.VITE_FALLBACK_TELEGRAM_USER_ID ?? "demo-telegram-user";
 const freeDeliveryThreshold = readMoneyEnv(import.meta.env.VITE_FREE_DELIVERY_THRESHOLD, DEFAULT_FREE_DELIVERY_THRESHOLD);
-const paidDeliveryPrice = readMoneyEnv(import.meta.env.VITE_PAID_DELIVERY_PRICE, DEFAULT_PAID_DELIVERY_PRICE);
 const pickupAddress = import.meta.env.VITE_PICKUP_ADDRESS ?? DEFAULT_PICKUP_ADDRESS;
 
 const currency = new Intl.NumberFormat("ru-RU", {
@@ -57,10 +58,15 @@ export function App() {
   const [screen, setScreen] = useState<Screen>("home");
   const [telegramUserId, setTelegramUserId] = useState(fallbackTelegramUserId);
   const [telegramName, setTelegramName] = useState("Гость");
+  const [telegramInitData, setTelegramInitData] = useState("");
+  const [telegramUser, setTelegramUser] = useState<{
+    firstName: string | null;
+    lastName: string | null;
+    username: string | null;
+  }>({ firstName: null, lastName: null, username: null });
   const [categories, setCategories] = useState<Category[]>(categoriesSeed);
   const [products, setProducts] = useState<Product[]>(productsSeed);
   const [selectedCategory, setSelectedCategory] = useState("breakfast");
-  const [query, setQuery] = useState("");
   const [cart, setCart] = useState<CartItem[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -68,6 +74,7 @@ export function App() {
     customerName: "Гость",
     phone: "",
     address: "",
+    comment: "",
     deliveryMethod: "paid_delivery"
   });
   const [isPaying, setIsPaying] = useState(false);
@@ -76,12 +83,18 @@ export function App() {
     const tg = window.Telegram?.WebApp;
     const user = tg?.initDataUnsafe?.user;
     const userId = user?.id;
+    setTelegramInitData(tg?.initData ?? "");
 
     if (userId) {
       setTelegramUserId(String(userId));
     }
 
     const name = [user?.first_name, user?.last_name].filter(Boolean).join(" ").trim() || user?.username || "Гость";
+    setTelegramUser({
+      firstName: user?.first_name ?? null,
+      lastName: user?.last_name ?? null,
+      username: user?.username ?? null
+    });
     setTelegramName(name);
     setCheckout((current) => ({
       ...current,
@@ -118,10 +131,13 @@ export function App() {
 
     fetch(`${apiUrl}/users`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: createApiHeaders(telegramInitData),
       body: JSON.stringify({
         telegramUserId,
-        name: telegramName
+        name: telegramName,
+        firstName: telegramUser.firstName,
+        lastName: telegramUser.lastName,
+        username: telegramUser.username
       })
     }).catch(() => undefined);
 
@@ -145,7 +161,7 @@ export function App() {
         }
       })
       .catch(() => undefined);
-  }, [telegramUserId, telegramName]);
+  }, [telegramUserId, telegramName, telegramInitData, telegramUser.firstName, telegramUser.lastName, telegramUser.username]);
 
   const cartProducts = useMemo(() => {
     return cart
@@ -161,28 +177,32 @@ export function App() {
   }, [cart]);
 
   const itemsTotal = cartProducts.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
-  const deliveryPrice = checkout.deliveryMethod === "pickup" || itemsTotal >= freeDeliveryThreshold ? 0 : paidDeliveryPrice;
-  const total = itemsTotal + deliveryPrice;
-  const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
+  const actualDeliveryMethod: DeliveryMethod =
+    checkout.deliveryMethod === "pickup" ? "pickup" : itemsTotal >= freeDeliveryThreshold ? "free_delivery" : "paid_delivery";
+  const deliveryPrice = 0;
+  const total = itemsTotal;
+  const cartCount = cart.length;
   const filteredProducts = products.filter((product) => {
     const matchesCategory = product.categoryId === selectedCategory;
-    const matchesQuery = product.title.toLowerCase().includes(query.toLowerCase().trim());
-    return matchesCategory && matchesQuery;
+    return matchesCategory;
   });
 
   const addToCart = (product: Product) => {
-    if (product.stock < 1) {
+    const step = quantityStep(product);
+    if (product.stock < step) {
       return;
     }
 
     setCart((current) => {
       const existing = current.find((item) => item.productId === product.id);
       if (!existing) {
-        return [...current, { productId: product.id, quantity: 1 }];
+        return [...current, { productId: product.id, quantity: step }];
       }
 
       return current.map((item) =>
-        item.productId === product.id ? { ...item, quantity: Math.min(item.quantity + 1, product.stock) } : item
+        item.productId === product.id
+          ? { ...item, quantity: normalizeQuantity(Math.min(item.quantity + step, product.stock)) }
+          : item
       );
     });
   };
@@ -196,7 +216,10 @@ export function App() {
           }
 
           const product = products.find((candidate) => candidate.id === productId);
-          const nextQuantity = Math.max(0, Math.min(item.quantity + delta, product?.stock ?? 0));
+          const step = product ? quantityStep(product) : 1;
+          const nextQuantity = normalizeQuantity(
+            Math.max(0, Math.min(item.quantity + Math.sign(delta) * step, product?.stock ?? 0))
+          );
           return { ...item, quantity: nextQuantity };
         })
         .filter((item) => item.quantity > 0)
@@ -216,13 +239,15 @@ export function App() {
         try {
           const response = await fetch(`${apiUrl}/orders`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: createApiHeaders(telegramInitData),
             body: JSON.stringify({
               telegramUserId,
               customerName: checkout.customerName,
               phone: checkout.phone,
-              address: checkout.deliveryMethod === "pickup" ? undefined : checkout.address,
-              deliveryMethod: checkout.deliveryMethod,
+              address: actualDeliveryMethod === "pickup" ? undefined : checkout.address,
+              comment: checkout.comment,
+              deliveryMethod: actualDeliveryMethod,
+              idempotencyKey: crypto.randomUUID(),
               items: cart
             })
           });
@@ -242,6 +267,7 @@ export function App() {
       order ??= createDemoOrder({
         telegramUserId,
         checkout,
+        deliveryMethod: actualDeliveryMethod,
         items: cartProducts,
         deliveryPrice,
         itemsTotal,
@@ -249,7 +275,7 @@ export function App() {
       });
 
       if (!order.items || !Array.isArray(order.items)) {
-        throw new Error("Некорректный ответ оплаты");
+        throw new Error("Некорректный ответ сервера");
       }
 
       setOrders((current) => [order, ...current]);
@@ -288,10 +314,8 @@ export function App() {
             categories={categories}
             products={filteredProducts}
             selectedCategory={selectedCategory}
-            query={query}
             selectedProduct={selectedProduct}
             cartQuantities={cartQuantities}
-            onQuery={setQuery}
             onSelectCategory={setSelectedCategory}
             onSelectProduct={setSelectedProduct}
             onBackProduct={() => setSelectedProduct(null)}
@@ -314,7 +338,7 @@ export function App() {
           />
         )}
 
-        {screen === "profile" && <ProfileScreen orders={orders} checkout={checkout} telegramUserId={telegramUserId} />}
+        {screen === "profile" && <ProfileScreen orders={orders} checkout={checkout} telegramName={telegramName} username={telegramUser.username} />}
       </main>
 
       <nav className="bottom-nav">
@@ -335,6 +359,7 @@ export function App() {
 function createDemoOrder({
   telegramUserId,
   checkout,
+  deliveryMethod,
   items,
   deliveryPrice,
   itemsTotal,
@@ -342,6 +367,7 @@ function createDemoOrder({
 }: {
   telegramUserId: string;
   checkout: CheckoutForm;
+  deliveryMethod: DeliveryMethod;
   items: Array<{ product: Product; quantity: number }>;
   deliveryPrice: number;
   itemsTotal: number;
@@ -355,13 +381,15 @@ function createDemoOrder({
     telegramUserId,
     customerName: checkout.customerName,
     phone: checkout.phone,
-    address: checkout.deliveryMethod === "pickup" ? null : checkout.address,
-    deliveryMethod: checkout.deliveryMethod,
+    address: deliveryMethod === "pickup" ? null : checkout.address,
+    deliveryMethod,
     deliveryPrice,
     itemsTotal,
     total,
-    paymentStatus: "paid",
-    status: "paid_new",
+    paymentStatus: "pending",
+    status: "new",
+    comment: checkout.comment || null,
+    idempotencyKey: null,
     items: items.map(({ product, quantity }) => ({
       productId: product.id,
       title: product.title,
@@ -369,6 +397,14 @@ function createDemoOrder({
       quantity,
       lineTotal: product.price * quantity
     })),
+    statusHistory: [
+      {
+        status: "new",
+        changedBy: "demo",
+        changedAt: now,
+        comment: null
+      }
+    ],
     createdAt: now,
     updatedAt: now
   };
@@ -389,17 +425,20 @@ function HomeScreen({
   onAddToCart: (product: Product) => void;
   onQuantity: (productId: string, delta: number) => void;
 }) {
-  const popular = products.filter((product) => product.stock > 0).slice(0, 4);
+  const popular = categories
+    .map((category) => products.find((product) => product.categoryId === category.id && product.stock > 0))
+    .filter((product): product is Product => Boolean(product))
+    .slice(0, 4);
 
   return (
     <div className="screen stack">
       <section className="hero">
         <div>
-          <p className="eyebrow">Все свое, готовим как для дома</p>
+          <p className="eyebrow">Домашняя еда в запас</p>
           <h1>Родная кухня</h1>
           <p>
-            Большой выбор домашней еды в запас: сырники, пельмени, котлеты, супы, готовые ужины, сладости и боксы на
-            неделю. Соберите корзину, оплатите онлайн, а мы напишем и договоримся по доставке.
+            Сырники, котлеты, пельмени и вареники ручной работы. Соберите корзину, отправьте заказ, а мы напишем и
+            договоримся по оплате и доставке.
           </p>
         </div>
         <button className="primary-button" onClick={() => onOpenCatalog(categories[0]?.id ?? "breakfast")}>
@@ -410,7 +449,7 @@ function HomeScreen({
 
       <section className="section">
         <div className="section-head">
-          <h2>Что положить в морозилку</h2>
+          <h2>Наше меню</h2>
         </div>
         <div className="category-grid">
           {categories.map((category) => (
@@ -435,6 +474,28 @@ function HomeScreen({
           compact
         />
       </section>
+
+      <InfoSection icon={<Baby size={22} />} title="Готовим и для детей">
+        <p>Заказываете для ребенка? Просто скажите нам об этом.</p>
+        <strong>Любую позицию из меню мы можем приготовить без лука и чеснока, с минимумом соли и сахара.</strong>
+        <p>Выбирайте то, что любит ваш ребенок: отдельно ограничивать выбор детским меню не нужно.</p>
+      </InfoSection>
+
+      <InfoSection icon={<PackageCheck size={22} />} title="Соберите запас на неделю">
+        <p>Большинство позиций можно заказать по 500 г или 1 кг.</p>
+        <p>
+          Не знаете, что выбрать? Напишите, на сколько человек хотите собрать запас, и мы поможем собрать морозилку
+          на неделю.
+        </p>
+      </InfoSection>
+
+      <InfoSection icon={<Truck size={22} />} title="Доставка и заказ">
+        <strong>Бесплатная доставка по городу при заказе от {currency.format(freeDeliveryThreshold)}.</strong>
+        <p>
+          При заказе до {currency.format(freeDeliveryThreshold)} доставка курьером за счет заказчика или самовывоз: <strong>{pickupAddress}</strong>.
+        </p>
+        <p>Для заказа просто напишите нам в чат. Мы обработаем заявку и подтвердим заказ.</p>
+      </InfoSection>
     </div>
   );
 }
@@ -443,10 +504,8 @@ function CatalogScreen(props: {
   categories: Category[];
   products: Product[];
   selectedCategory: string;
-  query: string;
   selectedProduct: Product | null;
   cartQuantities: Map<string, number>;
-  onQuery: (query: string) => void;
   onSelectCategory: (category: string) => void;
   onSelectProduct: (product: Product) => void;
   onBackProduct: () => void;
@@ -467,11 +526,7 @@ function CatalogScreen(props: {
 
   return (
     <div className="screen stack">
-      <Header title="Каталог" subtitle="Домашние заготовки, готовые блюда и наборы для семьи, детей и офиса" />
-      <label className="search-field">
-        <Search size={18} />
-        <input value={props.query} onChange={(event) => props.onQuery(event.target.value)} placeholder="Что ищем?" />
-      </label>
+      <Header title="Каталог" subtitle="Домашние сырники, котлеты, пельмени, вареники и заготовки для быстрого ужина" />
       <div className="chips-row">
         {props.categories.map((category) => (
           <button
@@ -507,7 +562,7 @@ function ProductDetails({
   onAddToCart: (product: Product) => void;
   onQuantity: (productId: string, delta: number) => void;
 }) {
-  const isAvailable = product.stock > 0;
+  const isAvailable = product.stock >= quantityStep(product);
 
   return (
     <div className="screen stack product-detail">
@@ -559,13 +614,19 @@ function CartScreen(props: {
     (props.checkout.deliveryMethod === "pickup" || props.checkout.address.trim().length > 3);
 
   const setForm = (patch: Partial<CheckoutForm>) => props.onCheckoutChange({ ...props.checkout, ...patch });
+  const actualDeliveryMethod: DeliveryMethod =
+    props.checkout.deliveryMethod === "pickup"
+      ? "pickup"
+      : props.itemsTotal >= freeDeliveryThreshold
+        ? "free_delivery"
+        : "paid_delivery";
 
   return (
     <div className="screen stack">
-      <Header title="Ваш заказ" subtitle="Проверьте выбранную еду, укажите контакты и оплатите онлайн" />
+      <Header title="Ваш заказ" subtitle="Проверьте выбранную еду, укажите контакты и отправьте заказ" />
 
       {props.items.length === 0 ? (
-        <EmptyState title="Пока ничего не выбрано" text="Добавьте сырники, пельмени, котлеты или готовые блюда из каталога." />
+        <EmptyState title="Пока ничего не выбрано" text="Добавьте сырники, котлеты, пельмени или вареники из каталога." />
       ) : (
         <div className="cart-list">
           {props.items.map(({ product, quantity }) => (
@@ -573,14 +634,14 @@ function CartScreen(props: {
               <img src={product.imageUrl} alt="" />
               <div>
                 <strong>{product.title}</strong>
-                <span>{product.unitLabel}</span>
+                <span>{formatCartQuantity(product, quantity)}</span>
                 <b>{currency.format(product.price * quantity)}</b>
               </div>
               <div className="stepper">
                 <button onClick={() => props.onQuantity(product.id, -1)} aria-label="Уменьшить">
                   <Minus size={16} />
                 </button>
-                <span>{quantity}</span>
+                <span>{formatQuantityNumber(quantity)}</span>
                 <button onClick={() => props.onQuantity(product.id, 1)} aria-label="Увеличить">
                   <Plus size={16} />
                 </button>
@@ -594,9 +655,9 @@ function CartScreen(props: {
         <h2>Как получить</h2>
         <div className="delivery-grid">
           <DeliveryButton
-            active={props.checkout.deliveryMethod === "paid_delivery"}
+            active={props.checkout.deliveryMethod !== "pickup"}
             title="Доставка"
-            text={props.itemsTotal >= freeDeliveryThreshold ? "0 ₽" : `${paidDeliveryPrice} ₽`}
+            text={props.itemsTotal >= freeDeliveryThreshold ? "Бесплатно" : "Оплата отдельно"}
             onClick={() => setForm({ deliveryMethod: props.itemsTotal >= freeDeliveryThreshold ? "free_delivery" : "paid_delivery" })}
           />
           <DeliveryButton active={props.checkout.deliveryMethod === "pickup"} title="Самовывоз" text="0 ₽" onClick={() => setForm({ deliveryMethod: "pickup" })} />
@@ -604,32 +665,36 @@ function CartScreen(props: {
 
         {leftToFreeDelivery > 0 && props.checkout.deliveryMethod !== "pickup" ? (
           <p className="delivery-note">
-            До бесплатной доставки осталось {currency.format(leftToFreeDelivery)}. Пока доставка считается как{" "}
-            {currency.format(paidDeliveryPrice)}.
+            До бесплатной доставки осталось {currency.format(leftToFreeDelivery)}. При меньшей сумме доставка
+            оплачивается заказчиком отдельно и не входит в сумму заказа.
           </p>
         ) : (
           props.checkout.deliveryMethod !== "pickup" && (
-            <p className="delivery-note">Доставка за наш счет. После оплаты администратор напишет и уточнит удобное время.</p>
+            <p className="delivery-note">Доставка за наш счет. После оформления администратор напишет и уточнит удобное время.</p>
           )
         )}
 
         {props.checkout.deliveryMethod === "pickup" ? (
-          <p className="delivery-note">Самовывоз: {pickupAddress}. После оплаты напишем и согласуем, когда удобно подойти.</p>
+          <p className="delivery-note">Самовывоз: {pickupAddress}. После оформления напишем и согласуем, когда удобно подойти.</p>
         ) : (
           <input className="input" value={props.checkout.address} onChange={(event) => setForm({ address: event.target.value })} placeholder="Адрес доставки" />
         )}
 
         <input className="input" value={props.checkout.customerName} onChange={(event) => setForm({ customerName: event.target.value })} placeholder="Имя" />
         <input className="input" value={props.checkout.phone} onChange={(event) => setForm({ phone: event.target.value })} placeholder="Телефон для связи" />
+        <input className="input" value={props.checkout.comment} onChange={(event) => setForm({ comment: event.target.value })} placeholder="Комментарий к заказу" />
       </section>
 
       <section className="summary">
         <SummaryLine label="Еда" value={currency.format(props.itemsTotal)} />
-        <SummaryLine label={deliveryLabel[props.checkout.deliveryMethod]} value={currency.format(props.deliveryPrice)} />
-        <SummaryLine label="К оплате" value={currency.format(props.total)} strong />
+        <SummaryLine
+          label={deliveryLabel[actualDeliveryMethod]}
+          value={actualDeliveryMethod === "paid_delivery" ? "Оплачивается отдельно" : actualDeliveryMethod === "free_delivery" ? "Бесплатно" : "0 ₽"}
+        />
+        <SummaryLine label="Итого" value={currency.format(props.total)} strong />
         <button className="primary-button" disabled={!canPay || props.isPaying} onClick={props.onPay}>
           <BadgeRussianRuble size={18} />
-          {props.isPaying ? "Оплачиваем" : "Оплатить заказ"}
+          {props.isPaying ? "Оформляем" : "Оформить заказ"}
         </button>
       </section>
     </div>
@@ -639,36 +704,43 @@ function CartScreen(props: {
 function ProfileScreen({
   orders,
   checkout,
-  telegramUserId
+  telegramName,
+  username
 }: {
   orders: Order[];
   checkout: CheckoutForm;
-  telegramUserId: string;
+  telegramName: string;
+  username: string | null;
 }) {
   const lastAddress = checkout.address || orders.find((order) => order.address)?.address || "";
+  const profileName = username ? `@${username}` : telegramName || "Гость";
 
   return (
     <div className="screen stack">
-      <Header title="Мои заказы" subtitle="Профиль привязан к Telegram ID. Телефон сохраняем только для связи по заказу." />
+      <Header title="Мои заказы" subtitle="Контакты сохраняем только для связи по заказу." />
       <section className="profile-band">
         <UserRound size={22} />
-        <div>
-          <strong>ID: {telegramUserId}</strong>
-          <span>{checkout.phone || "Телефон появится после оформления заказа"}</span>
+        <div className="profile-details">
+          <div className="profile-line">
+            <span>Telegram</span>
+            <strong>{profileName}</strong>
+          </div>
+          <div className="profile-line">
+            <span>Телефон</span>
+            <strong>{checkout.phone || "после оформления заказа"}</strong>
+          </div>
+          <div className="profile-line">
+            <span>Адрес</span>
+            <strong>{lastAddress || "сохраним после заказа"}</strong>
+          </div>
         </div>
-      </section>
-      <section className="section">
-        <div className="section-head">
-          <h2>Последний адрес</h2>
-        </div>
-        <p className="muted">{lastAddress || "Адрес сохраним после первого заказа с доставкой."}</p>
       </section>
       <section className="section">
         <div className="section-head">
           <h2>История</h2>
         </div>
         {orders.length === 0 ? (
-          <EmptyState title="Заказов пока нет" text="Когда оплатите первый заказ, он появится здесь." />
+          <EmptyState title="Заказов пока нет" text="Когда оформите первый заказ, он появится здесь." />
         ) : (
           <div className="orders-list">
             {orders.map((order) => (
@@ -677,7 +749,10 @@ function ProfileScreen({
                   <strong>Заказ {order.orderNumber}</strong>
                   <span>{order.items.map((item) => item.title).join(", ")}</span>
                 </div>
-                <b>{currency.format(order.total)}</b>
+                <div className="order-meta">
+                  <span className={`order-status ${profileOrderStatus(order.status).tone}`}>{profileOrderStatus(order.status).label}</span>
+                  <b>{currency.format(order.total)}</b>
+                </div>
               </article>
             ))}
           </div>
@@ -687,6 +762,22 @@ function ProfileScreen({
   );
 }
 
+function profileOrderStatus(status: Order["status"]) {
+  if (status === "completed" || status === "delivered" || status === "picked_up") {
+    return { label: "ЗАВЕРШЕН", tone: "is-done" };
+  }
+
+  if (status === "confirmed" || status === "cooking" || status === "ready" || status === "delivering" || status === "in_progress") {
+    return { label: "ГОТОВИТСЯ", tone: "is-progress" };
+  }
+
+  if (status === "cancelled") {
+    return { label: "ОТМЕНЕН", tone: "is-cancelled" };
+  }
+
+  return { label: "СОЗДАН", tone: "is-new" };
+}
+
 function Header({ title, subtitle }: { title: string; subtitle: string }) {
   return (
     <header className="screen-header">
@@ -694,6 +785,18 @@ function Header({ title, subtitle }: { title: string; subtitle: string }) {
       <h1>{title}</h1>
       <span>{subtitle}</span>
     </header>
+  );
+}
+
+function InfoSection({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+  return (
+    <section className="menu-info-section">
+      <div className="menu-info-heading">
+        {icon}
+        <h2>{title}</h2>
+      </div>
+      <div className="menu-info-copy">{children}</div>
+    </section>
   );
 }
 
@@ -746,7 +849,7 @@ function ProductList({
                   />
                 ) : (
                   <button
-                    disabled={product.stock < 1}
+                    disabled={product.stock < quantityStep(product)}
                     onClick={(event) => {
                       event.stopPropagation();
                       onAddToCart(product);
@@ -766,7 +869,11 @@ function ProductList({
 }
 
 function StatusBadge({ stock }: { stock: number }) {
-  return <span className={`status-badge ${stock > 0 ? "is-ok" : "is-empty"}`}>{stock > 0 ? `В наличии: ${stock}` : "Нет в наличии"}</span>;
+  return (
+    <span className={`status-badge ${stock > 0 ? "is-ok" : "is-empty"}`}>
+      {stock > 0 ? `В наличии: ${formatQuantityNumber(stock)}` : "Нет в наличии"}
+    </span>
+  );
 }
 
 function MiniStepper({
@@ -783,7 +890,7 @@ function MiniStepper({
       <button onClick={onMinus} aria-label="Уменьшить">
         <Minus size={14} />
       </button>
-      <span>{quantity}</span>
+      <span>{formatQuantityNumber(quantity)}</span>
       <button onClick={onPlus} aria-label="Увеличить">
         <Plus size={14} />
       </button>
@@ -797,7 +904,7 @@ function ProductStepper({ quantity, onMinus, onPlus }: { quantity: number; onMin
       <button onClick={onMinus} aria-label="Уменьшить">
         <Minus size={18} />
       </button>
-      <span>{quantity}</span>
+      <span>{formatQuantityNumber(quantity)}</span>
       <button onClick={onPlus} aria-label="Увеличить">
         <Plus size={18} />
       </button>
@@ -842,15 +949,47 @@ function NavButton({ icon, label, active, onClick }: { icon: React.ReactNode; la
   );
 }
 
+function quantityStep(product: Product) {
+  return product.unit === "kg" ? 0.5 : 1;
+}
+
+function normalizeQuantity(quantity: number) {
+  return Math.round(quantity * 10) / 10;
+}
+
+function formatQuantityNumber(quantity: number) {
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(quantity);
+}
+
+function formatCartQuantity(product: Product, quantity: number) {
+  if (product.unit === "kg") {
+    return quantity < 1 ? `${quantity * 1000} г` : `${formatQuantityNumber(quantity)} кг`;
+  }
+
+  if (product.unit === "100g") {
+    return `${quantity * 100} г`;
+  }
+
+  return `${formatQuantityNumber(quantity)} × ${product.unitLabel}`;
+}
+
 function readMoneyEnv(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function createApiHeaders(telegramInitData: string) {
+  return {
+    "Content-Type": "application/json",
+    ...(telegramInitData ? { "X-Telegram-Init-Data": telegramInitData } : {})
+  };
 }
 
 declare global {
   interface Window {
     Telegram?: {
       WebApp?: {
+        initData?: string;
         initDataUnsafe?: {
           user?: {
             id?: number;
